@@ -1,73 +1,35 @@
-# ============================================================
-# Amazon Product Scraper — Production Configuration
-# ============================================================
-# Edit this file to control what gets scraped, how many
-# products to target, proxy settings, and the AI layer.
-# Run the scraper via: python run.py
-# ============================================================
-
 # ----- Search Targets ----------------------------------------
-# List of Amazon search URLs to scrape.
-# Each URL will be paginated up to max_pages.
 search_urls:
   - "https://www.amazon.com/s?k=gaming+headset"
   - "https://www.amazon.com/s?k=gaming+mouse"
   - "https://www.amazon.com/s?k=gaming+keyboard"
   - "https://www.amazon.com/s?k=gaming+monitor"
 
-# ----- Scale ------------------------------------------------
-# Max search result pages to scrape per URL (Amazon shows ~16 results/page)
 max_pages: 1
 
-# Stop after successfully scraping this many products total.
 max_products: 50
 
-# ----- Concurrency & Timing ---------------------------------
-# How many concurrent requests Scrapy can fire at once.
-# Set to 1 for sequential, ban-safe scraping on Amazon without proxies.
 concurrency: 2
 
-# Seconds between requests (Scrapy's DOWNLOAD_DELAY).
-# Adds a human-like pause between pages.
 download_delay: 3.0
 
-# Per-page timeout in seconds. Playwright will wait this long
-# for navigation before giving up.
 timeout_seconds: 90
 
-# ----- Retry Policy -----------------------------------------
-# Max times to retry a single product page on failure.
 retry_count: 2
 
-# ----- Output -----------------------------------------------
-# Directory where products.jsonl, products.csv, etc. are saved.
-# Created automatically if it does not exist.
 output_dir: "output"
 
-# ----- Proxy Pool -------------------------------------------
-# Leave this list empty ([]) to scrape without proxies.
-# Format: "http://user:password@host:port"
-#         "socks5://user:password@host:port"
-#
-# Each proxy gets its own Playwright browser context so
-# cookies, sessions, and TLS fingerprints are isolated.
 proxies: []
 # Example:
 #   - "http://user1:pass1@residential1.proxy.com:8080"
-#   - "http://user2:pass2@residential2.proxy.com:8080"
 
-# Proxy health thresholds:
-proxy_max_consecutive_failures: 3   # Mark unhealthy after N consecutive fails
-proxy_cooldown_seconds: 300         # Seconds before retrying an unhealthy proxy
 
-# ----- AI Extraction Layer ----------------------------------
-# Runs AFTER the crawl to enrich product data using an LLM.
-# Set enabled: true and provide your API key to activate.
+proxy_max_consecutive_failures: 3   
+proxy_cooldown_seconds: 300         
+
 ai_extraction:
   enabled: false
-  provider: "gemini"           # "gemini" or "openai"
+  provider: "gemini"
   api_key: "AQ.Ab8RN6IOP4Lhrb_tOUr-9LhOLsoXAQqIJRYwNUw_qXYB-O9afQ"                  
-  model: "gemini-1.5-flash"   # Model name (e.g. gemini-1.5-flash or gemini-2.0-flash)
-  # Max products to process in the AI layer per run
-  # (to control API costs). Set to 0 for unlimited.
-  max_products: 50
+  model: "gemini-3.1-flash-lite"
+  max_products: 10

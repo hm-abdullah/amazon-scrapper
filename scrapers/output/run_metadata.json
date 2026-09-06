@@ -1,13 +1,13 @@
 {
-  "run_start": "2026-09-05T18:47:34.965061+00:00",
-  "run_end": "2026-09-05T18:47:43.192023+00:00",
-  "elapsed_seconds": 8.2,
+  "run_start": "2026-09-06T15:22:05.647986+00:00",
+  "run_end": "2026-09-06T15:36:48.434355+00:00",
+  "elapsed_seconds": 882.8,
   "search_urls": [],
   "pages_visited": 0,
-  "products_discovered": 0,
-  "products_scraped": 0,
+  "products_discovered": 88,
+  "products_scraped": 38,
   "products_failed": 0,
   "retries": 0,
-  "avg_processing_time_seconds": 0,
+  "avg_processing_time_seconds": 2.51,
   "proxy_stats": {}
 }

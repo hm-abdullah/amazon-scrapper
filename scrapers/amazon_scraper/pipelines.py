@@ -1,41 +1,22 @@
-# pipelines.py — Production Scrapy item pipelines.
-#
-# Pipeline execution order (set in settings.py):
-#   100 → DeduplicationPipeline  (drop duplicates early)
-#   200 → ValidationPipeline     (normalize + validate fields)
-#   300 → OutputPipeline         (write to files)
-#   400 → RunMetadataPipeline    (track stats, write run_metadata.json)
-#
-# Each pipeline is self-contained and fails gracefully.
+# Scrapy item processing pipelines for deduplication, validation, output, and SQLite storage.
 
 import csv
 import json
 import logging
+import sqlite3
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 from itemadapter import ItemAdapter
-
 from amazon_scraper.items import ProductDetailItem, FailedItem, SearchResultItem
 
 logger = logging.getLogger(__name__)
 
-
-# ── 1. Deduplication ──────────────────────────────────────────────────────────
-
 class DeduplicationPipeline:
-    """
-    Drops duplicate ProductDetailItems based on ASIN.
-
-    Maintains an in-memory set (fast) and also persists it to
-    storage/processed_asins.json so that resuming a run skips
-    already-scraped products.
-    """
-
     CHECKPOINT_FILE = Path(__file__).parent / "storage" / "processed_asins.json"
 
     def open_spider(self, spider):
-        # Load previously processed ASINs from disk & existing products.jsonl
         self.seen_asins: set = self._load_checkpoint(spider)
         self._item_count = 0
         logger.info("[Dedup] Loaded %d processed ASINs from checkpoint", len(self.seen_asins))
@@ -44,13 +25,12 @@ class DeduplicationPipeline:
         self._save_checkpoint()
 
     def process_item(self, item, spider):
-        # Only deduplicate full product items; pass everything else through
         if not isinstance(item, ProductDetailItem):
             return item
 
         asin = item.asin
         if not asin:
-            return item   # Can't deduplicate without ASIN
+            return item
 
         if asin in self.seen_asins:
             logger.debug("[Dedup] Dropping duplicate ASIN: %s", asin)
@@ -60,7 +40,6 @@ class DeduplicationPipeline:
         self.seen_asins.add(asin)
         self._item_count += 1
 
-        # Periodically save checkpoint to disk every 10 items for live visibility
         if self._item_count % 10 == 0:
             self._save_checkpoint()
 
@@ -68,31 +47,17 @@ class DeduplicationPipeline:
 
     def _load_checkpoint(self, spider=None) -> set:
         seen = set()
-        # 1. Read storage/processed_asins.json if it exists
         try:
-            if self.CHECKPOINT_FILE.exists():
-                with open(self.CHECKPOINT_FILE, "r") as f:
-                    data = json.load(f)
-                    seen.update(data.get("processed_asins", []))
+            db_path = Path(__file__).resolve().parent.parent / "storage" / "scraper.db"
+            if db_path.exists():
+                conn = sqlite3.connect(db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT asin FROM products WHERE asin IS NOT NULL")
+                rows = cursor.fetchall()
+                seen.update(r[0] for r in rows if r[0])
+                conn.close()
         except Exception as e:
-            logger.warning("[Dedup] Could not load checkpoint file: %s", e)
-
-        # 2. Also read output/products.jsonl if it exists (live fallback)
-        try:
-            output_dir = Path(getattr(spider, "output_dir", "output")) if spider else Path("output")
-            products_file = output_dir / "products.jsonl"
-            if products_file.exists():
-                with open(products_file, "r", encoding="utf-8") as f:
-                    for line in f:
-                        if line.strip():
-                            try:
-                                obj = json.loads(line)
-                                if obj.get("asin"):
-                                    seen.add(obj["asin"])
-                            except Exception:
-                                pass
-        except Exception as e:
-            logger.warning("[Dedup] Could not read products.jsonl for checkpoint fallback: %s", e)
+            logger.warning("[Dedup] Could not load checkpoint from SQLite DB: %s", e)
 
         return seen
 
@@ -107,42 +72,25 @@ class DeduplicationPipeline:
         except Exception as e:
             logger.warning("[Dedup] Could not save checkpoint: %s", e)
 
-
-# ── 2. Validation & Normalization ─────────────────────────────────────────────
-
 class ValidationPipeline:
-    """
-    Validates required fields and normalizes data types.
-
-    On validation failure: converts the ProductDetailItem into a
-    FailedItem so the failure is recorded — the item is NOT dropped,
-    just converted. This lets the OutputPipeline write it to failed_products.jsonl.
-    """
-
     def process_item(self, item, spider):
-        # Only validate full product items
         if not isinstance(item, ProductDetailItem):
             return item
 
         adapter = ItemAdapter(item)
 
-        # --- Required field check ---
         if not item.asin:
             return self._to_failed(item, "missing_asin", "Product has no ASIN")
 
         if not item.title:
             return self._to_failed(item, "missing_title", f"ASIN {item.asin} has no title")
 
-        # --- Price normalization ---
-        # Price is already a float from extractor, but double-check
         if item.price is not None:
             try:
                 item.price = float(item.price)
             except (TypeError, ValueError):
                 item.price = None
 
-        # --- Rating normalization ---
-        # Should be a float between 0–5
         if item.rating is not None:
             try:
                 r = float(item.rating)
@@ -150,15 +98,12 @@ class ValidationPipeline:
             except (TypeError, ValueError):
                 item.rating = None
 
-        # --- Review count normalization ---
-        # Should be a non-negative integer
         if item.review_count is not None:
             try:
                 item.review_count = int(item.review_count)
             except (TypeError, ValueError):
                 item.review_count = None
 
-        # --- Ensure scraped_at is set ---
         if not item.scraped_at:
             item.scraped_at = datetime.now(timezone.utc).isoformat()
 
@@ -166,7 +111,6 @@ class ValidationPipeline:
 
     @staticmethod
     def _to_failed(item: ProductDetailItem, failure_type: str, message: str) -> FailedItem:
-        """Convert a ProductDetailItem to a FailedItem for failure tracking."""
         logger.warning("[Validation] %s → %s", failure_type, message)
         return FailedItem(
             url=item.product_url,
@@ -177,35 +121,20 @@ class ValidationPipeline:
             retry_count=0,
         )
 
-
-# ── 3. Output ─────────────────────────────────────────────────────────────────
-
 class OutputPipeline:
-    """
-    Writes items to disk:
-      - ProductDetailItem → output/products.jsonl  (append)
-      - ProductDetailItem → output/products.csv    (append)
-      - SearchResultItem  → output/search_results.jsonl (append)
-      - FailedItem        → output/failed_products.jsonl (append)
-    """
-
-    # CSV column order — matches ProductDetailItem fields
     CSV_FIELDS = [
         "asin", "brand", "title", "seller", "price", "currency",
         "availability", "rating", "review_count", "product_url", "scraped_at",
     ]
 
     def open_spider(self, spider):
-        # Resolve output directory from spider's config (set in settings.py)
         output_dir = Path(getattr(spider, "output_dir", "output"))
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # Open file handles (append mode so resume works)
         self._jsonl_file = open(output_dir / "products.jsonl", "a", encoding="utf-8")
         self._search_results_file = open(output_dir / "search_results.jsonl", "a", encoding="utf-8")
         self._failed_file = open(output_dir / "failed_products.jsonl", "a", encoding="utf-8")
 
-        # CSV — write header only if file is new (empty)
         csv_path = output_dir / "products.csv"
         write_header = not csv_path.exists() or csv_path.stat().st_size == 0
         self._csv_raw = open(csv_path, "a", newline="", encoding="utf-8")
@@ -226,13 +155,10 @@ class OutputPipeline:
     def process_item(self, item, spider):
         if isinstance(item, ProductDetailItem):
             self._write_product(item)
-
         elif isinstance(item, SearchResultItem):
             self._write_search_result(item)
-
         elif isinstance(item, FailedItem):
             self._write_failed(item)
-
         return item
 
     def _write_product(self, item: ProductDetailItem) -> None:
@@ -240,7 +166,6 @@ class OutputPipeline:
         self._jsonl_file.write(json.dumps(row, ensure_ascii=False) + "\n")
         self._jsonl_file.flush()
 
-        # CSV only gets the scalar fields (no lists/dicts)
         csv_row = {k: row.get(k) for k in self.CSV_FIELDS}
         self._csv_writer.writerow(csv_row)
         self._csv_raw.flush()
@@ -255,32 +180,14 @@ class OutputPipeline:
         self._failed_file.write(json.dumps(row, ensure_ascii=False) + "\n")
         self._failed_file.flush()
 
-
-# ── 4. Run Metadata ───────────────────────────────────────────────────────────
-
 class RunMetadataPipeline:
-    """
-    Tracks statistics throughout the run and writes run_metadata.json
-    when the spider closes.
-
-    Stats tracked:
-      - Start / end time
-      - Search URLs
-      - Pages visited
-      - Products discovered (from search cards)
-      - Products successfully scraped
-      - Failed products
-      - Retries performed
-      - Average processing time per product
-    """
-
     def open_spider(self, spider):
         self._start_time = datetime.now(timezone.utc)
         self._pages_visited = 0
         self._products_discovered = 0
         self._products_scraped = 0
         self._products_failed = 0
-        self._processing_times = []   # List of seconds per product
+        self._processing_times = []
 
         self._output_dir = Path(getattr(spider, "output_dir", "output"))
         self._search_urls = getattr(spider, "search_urls", [])
@@ -319,19 +226,14 @@ class RunMetadataPipeline:
                     self._products_scraped, self._products_failed, metadata_path)
 
     def process_item(self, item, spider):
-        import time
-
         if isinstance(item, SearchResultItem):
             self._products_discovered += 1
-
         elif isinstance(item, ProductDetailItem):
             self._products_scraped += 1
-            # Track timing if spider set it on the item
             t = getattr(item, "_processing_time", None)
             if t:
                 self._processing_times.append(t)
             logger.info("[INFO] Product scraped: %s", item.asin)
-
         elif isinstance(item, FailedItem):
             self._products_failed += 1
             logger.warning("[WARN] Product failed: %s — %s", item.asin, item.failure_type)
@@ -339,5 +241,159 @@ class RunMetadataPipeline:
         return item
 
     def increment_pages(self) -> None:
-        """Called by the spider after each search page is processed."""
         self._pages_visited += 1
+
+class SQLitePipeline:
+    def open_spider(self, spider):
+        db_path = Path(__file__).resolve().parent.parent / 'storage' / 'scraper.db'
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+        self.conn = sqlite3.connect(db_path)
+        self.cursor = self.conn.cursor()
+        
+        self.cursor.executescript('''
+            CREATE TABLE IF NOT EXISTS products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                asin TEXT UNIQUE NOT NULL,
+                brand TEXT,
+                title TEXT,
+                seller TEXT,
+                price REAL,
+                currency TEXT,
+                availability TEXT,
+                description TEXT,
+                bullet_points TEXT,
+                specifications TEXT,
+                images TEXT,
+                rating REAL,
+                review_count INTEGER,
+                product_url TEXT,
+                scraped_at TEXT,
+                run_id TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS failed_products (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                url TEXT,
+                asin TEXT,
+                timestamp TEXT,
+                failure_type TEXT,
+                failure_message TEXT,
+                retry_count INTEGER DEFAULT 0,
+                run_id TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS scrape_runs (
+                id TEXT PRIMARY KEY,
+                status TEXT DEFAULT 'pending',
+                max_products INTEGER,
+                target_urls TEXT,
+                products_scraped INTEGER DEFAULT 0,
+                products_failed INTEGER DEFAULT 0,
+                products_discovered INTEGER DEFAULT 0,
+                started_at TEXT,
+                completed_at TEXT,
+                error_message TEXT
+            );
+        ''')
+        self.conn.commit()
+        
+        self.run_id = getattr(spider, 'run_id', None) or spider.settings.get('RUN_ID') or str(uuid.uuid4())
+        self._scraped_count = 0
+        self._failed_count = 0
+        
+        max_products = getattr(spider, 'max_products', None)
+        search_urls = getattr(spider, 'search_urls', [])
+        
+        try:
+            self.cursor.execute("SELECT id FROM scrape_runs WHERE id = ?", (self.run_id,))
+            if self.cursor.fetchone():
+                self.cursor.execute('''
+                    UPDATE scrape_runs
+                    SET status = 'running', max_products = COALESCE(?, max_products), target_urls = COALESCE(?, target_urls)
+                    WHERE id = ?
+                ''', (max_products, json.dumps(search_urls) if search_urls else None, self.run_id))
+            else:
+                self.cursor.execute('''
+                    INSERT INTO scrape_runs (id, status, max_products, target_urls, started_at)
+                    VALUES (?, ?, ?, ?, ?)
+                ''', (
+                    self.run_id, 
+                    'running', 
+                    max_products, 
+                    json.dumps(search_urls), 
+                    datetime.now(timezone.utc).isoformat()
+                ))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"[SQLite] Failed to insert/update scrape_run: {e}")
+
+    def close_spider(self, spider):
+        try:
+            self.cursor.execute('''
+                UPDATE scrape_runs
+                SET status = 'completed', completed_at = ?, products_scraped = ?, products_failed = ?
+                WHERE id = ?
+            ''', (datetime.now(timezone.utc).isoformat(), self._scraped_count, self._failed_count, self.run_id))
+            self.conn.commit()
+        except Exception as e:
+            logger.error(f"[SQLite] Failed to update scrape_run: {e}")
+        finally:
+            self.conn.close()
+
+    def process_item(self, item, spider):
+        try:
+            if isinstance(item, ProductDetailItem):
+                adapter = ItemAdapter(item)
+                
+                bullet_points = json.dumps(adapter.get('bullet_points', []))
+                specifications = json.dumps(adapter.get('specifications', {}))
+                images = json.dumps(adapter.get('images', []))
+                
+                self.cursor.execute('''
+                    INSERT OR IGNORE INTO products (
+                        asin, brand, title, seller, price, currency, availability, 
+                        description, bullet_points, specifications, images, rating, 
+                        review_count, product_url, scraped_at, run_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    adapter.get('asin'), adapter.get('brand'), adapter.get('title'),
+                    adapter.get('seller'), adapter.get('price'), adapter.get('currency'),
+                    adapter.get('availability'), adapter.get('description'), bullet_points,
+                    specifications, images, adapter.get('rating'), adapter.get('review_count'),
+                    adapter.get('product_url'), adapter.get('scraped_at'), self.run_id
+                ))
+                
+                self._scraped_count += 1
+                self.cursor.execute('''
+                    UPDATE scrape_runs SET products_scraped = ? WHERE id = ?
+                ''', (self._scraped_count, self.run_id))
+                self.conn.commit()
+                
+            elif isinstance(item, FailedItem):
+                adapter = ItemAdapter(item)
+                self.cursor.execute('''
+                    INSERT INTO failed_products (
+                        url, asin, timestamp, failure_type, failure_message, retry_count, run_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (
+                    adapter.get('url'), adapter.get('asin'), adapter.get('timestamp'),
+                    adapter.get('failure_type'), adapter.get('failure_message'),
+                    adapter.get('retry_count', 0), self.run_id
+                ))
+                
+                self._failed_count += 1
+                self.cursor.execute('''
+                    UPDATE scrape_runs SET products_failed = ? WHERE id = ?
+                ''', (self._failed_count, self.run_id))
+                self.conn.commit()
+                
+            elif isinstance(item, SearchResultItem):
+                self.cursor.execute('''
+                    UPDATE scrape_runs SET products_discovered = products_discovered + 1 WHERE id = ?
+                ''', (self.run_id,))
+                self.conn.commit()
+                
+        except Exception as e:
+            logger.error(f"[SQLite] Failed to process item: {e}")
+            
+        return item

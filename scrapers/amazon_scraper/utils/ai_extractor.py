@@ -1,25 +1,24 @@
-# utils/ai_extractor.py — Post-crawl AI enrichment using Google Gemini.
-#
-# This is a STANDALONE script — not part of the Scrapy pipeline.
-# Run it via:  python run.py --ai-only
-# Or called automatically at the end of a full run if ai_extraction.enabled=true.
-#
-# It reads output/products.jsonl, sends each product to Gemini, and saves
-# structured attributes to output/ai_attributes.jsonl.
+# Post-crawl AI product attribute extraction using Gemini or OpenAI.
 
 import json
 import logging
+import os
+import sqlite3
+import site
+import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+user_site = site.getusersitepackages()
+if user_site and user_site not in sys.path:
+    sys.path.append(user_site)
+
 logger = logging.getLogger(__name__)
 
-# Expected JSON structure that Gemini must return.
-# We validate this before saving.
 REQUIRED_KEYS = {"asin", "category", "attributes"}
 
-# Prompt template — keep it tight to reduce token usage.
 PROMPT_TEMPLATE = """You are a product data analyst. Extract structured attributes from this Amazon product listing.
 
 Return ONLY a valid JSON object with this exact structure (no markdown, no explanation):
@@ -47,98 +46,156 @@ Description:
 {description}
 """
 
+def get_db_path() -> Path:
+    return Path(__file__).resolve().parent.parent.parent / "storage" / "scraper.db"
 
-def run_ai_extraction(config: dict, output_dir: Path) -> None:
-    """
-    Main entry point. Reads products.jsonl and writes ai_attributes.jsonl.
+def init_ai_table(conn: sqlite3.Connection):
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS ai_attributes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            asin TEXT UNIQUE NOT NULL,
+            category TEXT,
+            attributes TEXT,
+            extracted_at TEXT,
+            run_id TEXT
+        )
+    """)
+    conn.commit()
 
-    Args:
-        config: The loaded config.yaml dict.
-        output_dir: Path to the output directory.
-    """
-    products_file = output_dir / "products.jsonl"
-    output_file = output_dir / "ai_attributes.jsonl"
-
-    if not products_file.exists():
-        logger.error("[AI] products.jsonl not found at %s", products_file)
-        return
+def run_ai_extraction(config: dict, run_id: Optional[str] = None) -> None:
+    db_path = get_db_path()
+    if not db_path.exists():
+        logger.error("[AI] Database not found at %s", db_path)
+        print(f"[AI_ERROR] Database not found at {db_path}", flush=True)
+        sys.exit(1)
 
     ai_cfg = config.get("ai_extraction", {})
     provider = ai_cfg.get("provider", "gemini")
-    api_key = ai_cfg.get("api_key", "")
-    model_name = ai_cfg.get("model", "gemini-3.5-flash-lite")
-    max_products = ai_cfg.get("max_products", 200)
+    api_key = ai_cfg.get("api_key") or os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+    model_name = ai_cfg.get("model", "gemini-1.5-flash")
+    max_products = ai_cfg.get("max_products", 50)
+
+    if not api_key or api_key.startswith("AQ.Ab8RN"):
+        env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
+        if env_key:
+            api_key = env_key
 
     if not api_key:
-        logger.error("[AI] No API key configured in config.yaml under ai_extraction.api_key")
+        error_msg = "No API key configured. Please set ai_extraction.api_key in config.yaml or GEMINI_API_KEY environment variable."
+        logger.error("[AI] %s", error_msg)
+        print(f"[AI_ERROR] {error_msg}", flush=True)
+        sys.exit(1)
+
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    init_ai_table(conn)
+
+    cursor = conn.cursor()
+    
+    query = """
+        SELECT p.* FROM products p
+        LEFT JOIN ai_attributes a ON p.asin = a.asin
+        WHERE a.asin IS NULL
+    """
+    params = []
+    if run_id and run_id != "all":
+        query += " AND p.run_id = ?"
+        params.append(run_id)
+
+    query += " ORDER BY p.scraped_at DESC"
+    if max_products and max_products > 0:
+        query += " LIMIT ?"
+        params.append(max_products)
+
+    cursor.execute(query, params)
+    products = [dict(r) for r in cursor.fetchall()]
+
+    if not products:
+        print("[AI_COMPLETED] 0/0 (No unextracted products found)", flush=True)
+        conn.close()
         return
 
-    # Load products
-    products = _load_jsonl(products_file)
-    if max_products:
-        products = products[:max_products]
+    total = len(products)
+    logger.info("[AI] Starting AI extraction for %d products (provider: %s)", total, provider)
+    print(f"[AI_STARTED] total={total}", flush=True)
 
-    # Load already-processed ASINs so we can resume
-    already_done = _load_done_asins(output_file)
-
-    logger.info("[AI] Starting AI extraction for %d products (provider: %s)", len(products), provider)
-
-    # Set up the LLM client
+    client = None
     if provider == "gemini":
         client = _build_gemini_client(api_key, model_name)
     elif provider == "openai":
         client = _build_openai_client(api_key, model_name)
     else:
-        logger.error("[AI] Unknown provider '%s'. Use 'gemini' or 'openai'.", provider)
-        return
+        logger.error("[AI] Unknown provider '%s'", provider)
+        print(f"[AI_ERROR] Unknown provider '{provider}'", flush=True)
+        conn.close()
+        sys.exit(1)
 
     if client is None:
-        return  # Error already logged inside builder
+        print("[AI_ERROR] Failed to initialize LLM client", flush=True)
+        conn.close()
+        sys.exit(1)
 
     success = 0
     failed = 0
 
-    with open(output_file, "a", encoding="utf-8") as out_f:
-        for product in products:
-            asin = product.get("asin")
-            if not asin:
-                continue
-            if asin in already_done:
-                logger.debug("[AI] Skipping already-processed ASIN: %s", asin)
-                continue
+    for i, product in enumerate(products, start=1):
+        asin = product.get("asin", "UNKNOWN")
+        title = product.get("title", "")
+        brand = product.get("brand", "")
+        bullets_raw = product.get("bullet_points") or "[]"
+        try:
+            bullets_list = json.loads(bullets_raw) if isinstance(bullets_raw, str) else bullets_raw
+        except Exception:
+            bullets_list = []
 
-            result = _extract_attributes(client, provider, product)
+        description = product.get("description", "")
+        target_run_id = product.get("run_id") or run_id or ""
 
-            if result is not None:
-                out_f.write(json.dumps(result, ensure_ascii=False) + "\n")
-                out_f.flush()
-                success += 1
-                logger.info("[AI] Extracted attributes for ASIN: %s  category=%s",
-                            asin, result.get("category", "?"))
-            else:
-                failed += 1
-                logger.warning("[AI] Failed to extract attributes for ASIN: %s", asin)
+        print(f"[AI_PROGRESS] {i}/{total} ASIN:{asin} TITLE:{title[:30]}", flush=True)
 
-            # Polite delay between API calls to avoid rate limits
-            time.sleep(1.0)
+        result = _extract_attributes(client, provider, {
+            "asin": asin,
+            "title": title,
+            "brand": brand,
+            "bullet_points": bullets_list,
+            "description": description
+        })
 
-    logger.info("[AI] Done — %d succeeded, %d failed. Output: %s", success, failed, output_file)
+        if result is not None:
+            now_iso = datetime.now(timezone.utc).isoformat()
+            cursor.execute("""
+                INSERT OR REPLACE INTO ai_attributes (asin, category, attributes, extracted_at, run_id)
+                VALUES (?, ?, ?, ?, ?)
+            """, (
+                asin,
+                result.get("category", "general"),
+                json.dumps(result.get("attributes", {})),
+                now_iso,
+                target_run_id
+            ))
+            conn.commit()
+            success += 1
+            logger.info("[AI] (%d/%d) Extracted ASIN: %s category: %s", i, total, asin, result.get("category"))
+        else:
+            failed += 1
+            logger.warning("[AI] (%d/%d) Failed ASIN: %s", i, total, asin)
 
+        time.sleep(0.5)
 
-# ── Internal helpers ──────────────────────────────────────────────────────────
+    conn.close()
+    print(f"[AI_COMPLETED] success={success} failed={failed} total={total}", flush=True)
 
 def _extract_attributes(client, provider: str, product: dict) -> Optional[dict]:
-    """Calls the LLM and returns a validated dict, or None on failure."""
     asin = product.get("asin", "UNKNOWN")
     prompt = PROMPT_TEMPLATE.format(
         asin=asin,
         title=product.get("title", ""),
         brand=product.get("brand", "Unknown"),
         bullets="\n".join(f"- {b}" for b in product.get("bullet_points", [])),
-        description=(product.get("description") or "")[:800],   # Cap length
+        description=(product.get("description") or "")[:800],
     )
 
-    # Try up to 3 times with exponential backoff
     for attempt in range(3):
         try:
             raw_text = _call_llm(client, provider, prompt)
@@ -146,15 +203,13 @@ def _extract_attributes(client, provider: str, product: dict) -> Optional[dict]:
             if result:
                 return result
         except Exception as e:
-            wait = 2 ** attempt
-            logger.warning("[AI] LLM call failed (attempt %d/3): %s — retrying in %ds", attempt + 1, e, wait)
+            wait = 1.5 ** attempt
+            logger.warning("[AI] LLM call failed (attempt %d/3): %s — retrying in %.1fs", attempt + 1, e, wait)
             time.sleep(wait)
 
     return None
 
-
 def _call_llm(client, provider: str, prompt: str) -> str:
-    """Calls the configured LLM and returns the raw text response."""
     if provider == "gemini":
         response = client.generate_content(prompt)
         return response.text
@@ -167,13 +222,7 @@ def _call_llm(client, provider: str, prompt: str) -> str:
         return response.choices[0].message.content
     raise ValueError(f"Unknown provider: {provider}")
 
-
 def _parse_and_validate(raw_text: str, asin: str) -> Optional[dict]:
-    """
-    Strips markdown fences if present, parses JSON, validates structure.
-    Returns the dict if valid, None otherwise.
-    """
-    # Strip ```json ... ``` markdown fences if the model added them
     text = raw_text.strip()
     if text.startswith("```"):
         lines = text.split("\n")
@@ -185,7 +234,6 @@ def _parse_and_validate(raw_text: str, asin: str) -> Optional[dict]:
         logger.warning("[AI] Invalid JSON from LLM for %s: %s", asin, e)
         return None
 
-    # Validate required keys exist
     missing = REQUIRED_KEYS - set(data.keys())
     if missing:
         logger.warning("[AI] LLM response missing keys %s for %s", missing, asin)
@@ -197,53 +245,21 @@ def _parse_and_validate(raw_text: str, asin: str) -> Optional[dict]:
 
     return data
 
-
 def _build_gemini_client(api_key: str, model_name: str):
-    """Creates and returns a Gemini GenerativeModel client."""
     try:
         import google.generativeai as genai
         genai.configure(api_key=api_key)
         return genai.GenerativeModel(model_name)
     except ImportError:
-        logger.error("[AI] google-generativeai package not installed. Run: pip install google-generativeai")
+        logger.error("[AI] google-generativeai package not installed.")
         return None
 
-
 def _build_openai_client(api_key: str, model_name: str):
-    """Creates and returns an OpenAI client (with model name stored on it)."""
     try:
         from openai import OpenAI
         client = OpenAI(api_key=api_key)
-        client._model = model_name   # Store model on the client for _call_llm
+        client._model = model_name
         return client
     except ImportError:
-        logger.error("[AI] openai package not installed. Run: pip install openai")
+        logger.error("[AI] openai package not installed.")
         return None
-
-
-def _load_jsonl(path: Path) -> list:
-    """Reads a .jsonl file and returns a list of dicts."""
-    items = []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line:
-                    try:
-                        items.append(json.loads(line))
-                    except json.JSONDecodeError:
-                        pass
-    except Exception as e:
-        logger.error("[AI] Could not read %s: %s", path, e)
-    return items
-
-
-def _load_done_asins(output_file: Path) -> set:
-    """Reads existing ai_attributes.jsonl to get already-processed ASINs."""
-    done = set()
-    if output_file.exists():
-        for item in _load_jsonl(output_file):
-            asin = item.get("asin")
-            if asin:
-                done.add(asin)
-    return done
