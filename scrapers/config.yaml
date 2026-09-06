@@ -30,6 +30,6 @@ proxy_cooldown_seconds: 300
 ai_extraction:
   enabled: false
   provider: "gemini"
-  api_key: "AQ.Ab8RN6IOP4Lhrb_tOUr-9LhOLsoXAQqIJRYwNUw_qXYB-O9afQ"                  
+  api_key: ""
   model: "gemini-3.1-flash-lite"
   max_products: 10

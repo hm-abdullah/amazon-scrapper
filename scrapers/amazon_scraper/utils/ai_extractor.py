@@ -46,6 +46,24 @@ Description:
 {description}
 """
 
+def load_env_vars():
+    possible_paths = [
+        Path(__file__).resolve().parent.parent.parent / ".env",
+        Path(__file__).resolve().parent.parent.parent.parent / ".env",
+        Path.cwd() / ".env",
+    ]
+    for env_path in possible_paths:
+        if env_path.exists():
+            try:
+                with open(env_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#") and "=" in line:
+                            k, v = line.split("=", 1)
+                            os.environ[k.strip()] = v.strip().strip("'\"")
+            except Exception as e:
+                logger.warning("[AI] Could not load env file %s: %s", env_path, e)
+
 def get_db_path() -> Path:
     return Path(__file__).resolve().parent.parent.parent / "storage" / "scraper.db"
 
@@ -64,6 +82,7 @@ def init_ai_table(conn: sqlite3.Connection):
     conn.commit()
 
 def run_ai_extraction(config: dict, run_id: Optional[str] = None) -> None:
+    load_env_vars()
     db_path = get_db_path()
     if not db_path.exists():
         logger.error("[AI] Database not found at %s", db_path)
@@ -72,17 +91,19 @@ def run_ai_extraction(config: dict, run_id: Optional[str] = None) -> None:
 
     ai_cfg = config.get("ai_extraction", {})
     provider = ai_cfg.get("provider", "gemini")
-    api_key = ai_cfg.get("api_key") or os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+    
+    api_key = ai_cfg.get("api_key") or ""
+    if not api_key or api_key.startswith("${"):
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+    
+    if not api_key:
+        api_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY") or ""
+
     model_name = ai_cfg.get("model", "gemini-1.5-flash")
     max_products = ai_cfg.get("max_products", 50)
 
-    if not api_key or api_key.startswith("AQ.Ab8RN"):
-        env_key = os.environ.get("GEMINI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-        if env_key:
-            api_key = env_key
-
     if not api_key:
-        error_msg = "No API key configured. Please set ai_extraction.api_key in config.yaml or GEMINI_API_KEY environment variable."
+        error_msg = "No API key configured. Please set GEMINI_API_KEY in scrapers/.env or ai_extraction.api_key in config.yaml."
         logger.error("[AI] %s", error_msg)
         print(f"[AI_ERROR] {error_msg}", flush=True)
         sys.exit(1)
